@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import os
-from typing import IO, Any, BinaryIO
+import re
+import json
+import multiprocessing as mp
+from typing import IO, Any, BinaryIO, Dict, List, Tuple, Set
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from jaxtyping import Float, Int
 
 import numpy.typing as npt
 import torch
 from torch import Tensor
+
+# Use regex package for Unicode property escapes
+try:
+    import regex
+except ImportError:
+    # Fallback to re if regex is not available
+    regex = re
 
 
 def run_linear(
@@ -589,4 +600,132 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # Import the chunking function
+    from cs336_basics.pretokenization_example import find_chunk_boundaries
+    
+    # GPT-2 regex pattern for pre-tokenization
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    
+    def preprocess_chunk(chunk_text: str, special_tokens: List[str]) -> Dict[Tuple[bytes, ...], int]:
+        """Pre-tokenize a chunk and return frequency counts of byte sequences."""
+        # Remove special tokens and split on them
+        if special_tokens:
+            # Escape special characters in special tokens for regex
+            escaped_tokens = [regex.escape(token) for token in special_tokens]
+            pattern = "|".join(escaped_tokens)
+            # Split on special tokens
+            parts = regex.split(pattern, chunk_text)
+        else:
+            parts = [chunk_text]
+        
+        # Count pre-tokens in each part
+        pre_token_counts = Counter()
+        
+        for part in parts:
+            if not part.strip():
+                continue
+            # Use regex to find all pre-tokens
+            for match in regex.finditer(PAT, part):
+                pre_token = match.group()
+                # Convert to raw bytes
+                pre_token_bytes = tuple(pre_token.encode('utf-8'))
+                pre_token_counts[pre_token_bytes] += 1
+        
+        return pre_token_counts
+    
+    def merge_bpe_tokens(
+        pre_token_counts: Dict[Tuple[bytes, ...], int],
+        max_merges: int,
+        start_token_id: int = 256
+    ) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+        """Perform BPE merges and return vocabulary and merges."""
+        # Initialize vocabulary with all bytes (0-255)
+        vocab = {i: bytes([i]) for i in range(256)}
+        next_token_id = start_token_id
+        
+        merges = []
+        
+        # Convert pre-tokens to byte sequences with counts
+        token_sequences = {}
+        for byte_seq, count in pre_token_counts.items():
+            byte_seq_bytes = bytes(byte_seq)
+            token_sequences[byte_seq_bytes] = count
+        
+        # Perform merges
+        for _ in range(max_merges):
+            # Count pairs
+            pair_counts = defaultdict(int)
+            for byte_seq_bytes, count in token_sequences.items():
+                for i in range(len(byte_seq_bytes) - 1):
+                    pair = (bytes([byte_seq_bytes[i]]), bytes([byte_seq_bytes[i + 1]]))
+                    pair_counts[pair] += count
+            
+            if not pair_counts:
+                break
+                
+            # Find most frequent pair, breaking ties lexicographically
+            best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+            
+            # Add to merges
+            merges.append(best_pair)
+            
+            # Add new token to vocabulary
+            new_token = best_pair[0] + best_pair[1]
+            vocab[next_token_id] = new_token
+            next_token_id += 1
+            
+            # Update token sequences
+            new_token_sequences = {}
+            for byte_seq_bytes, count in token_sequences.items():
+                # Apply the merge to this sequence
+                new_seq = []
+                i = 0
+                while i < len(byte_seq_bytes):
+                    if i < len(byte_seq_bytes) - 1 and (bytes([byte_seq_bytes[i]]), bytes([byte_seq_bytes[i + 1]])) == best_pair:
+                        new_seq.append(new_token)
+                        i += 2
+                    else:
+                        new_seq.append(bytes([byte_seq_bytes[i]]))
+                        i += 1
+                
+                # Only keep sequences that still have pairs to merge
+                if len(new_seq) > 1:
+                    new_seq_bytes = b''.join(new_seq)
+                    new_token_sequences[new_seq_bytes] = count
+            
+            token_sequences = new_token_sequences
+        
+        return vocab, merges
+    
+    # Read the input file
+    with open(input_path, 'r', encoding='utf-8') as f:
+        corpus_text = f.read()
+    
+    # Calculate how many merges we can perform
+    # Start with 256 bytes + special tokens
+    initial_vocab_size = 256 + len(special_tokens)
+    max_merges = vocab_size - initial_vocab_size
+    
+    if max_merges <= 0:
+        # Just return the initial vocabulary
+        vocab = {i: bytes([i]) for i in range(256)}
+        next_token_id = 256
+        for special_token in special_tokens:
+            vocab[next_token_id] = special_token.encode('utf-8')
+            next_token_id += 1
+        return vocab, []
+    
+    # Pre-tokenize the corpus
+    pre_token_counts = preprocess_chunk(corpus_text, special_tokens)
+    
+    # Perform BPE merges (start after special tokens)
+    start_token_id = 256 + len(special_tokens)
+    merged_vocab, merges = merge_bpe_tokens(pre_token_counts, max_merges, start_token_id)
+    
+    # Add special tokens to the merged vocabulary
+    next_token_id = 256
+    for special_token in special_tokens:
+        merged_vocab[next_token_id] = special_token.encode('utf-8')
+        next_token_id += 1
+    
+    return merged_vocab, merges
